@@ -1,18 +1,6 @@
-# Math Drill — Build Notes
+# Math Drill build notes
 
-## Architecture
-- 5-state machine: Menu, Playing, Feedback, Results, BestScores
-- TRNG-generated operands with rejection sampling
-- Division uses reverse-generation (answer * b = a) for clean integers
-- Ticktimer for per-problem timing and feedback auto-advance
-
-## Key Patterns
-**OpMode enum** — Single(Operation) or Mixed for random operation selection
-**Feedback state** — 1.5s auto-advance or key skip; shows correct answer on wrong
-**Progress bar** — filled rectangle proportional to problems completed
-**Best score caching** — loaded into main loop vars to avoid borrow issues with storage
-
-## Build
-```bash
-cargo build -p mathdrill --target riscv32imac-unknown-xous-elf
-```
+- Problem generation, scoring and the quiz state machine (`Drill`) are in `core/` (host-tested: `cd core && cargo test`). All randomness goes through `precursor_appkit_core::entropy` (`below`), never modulo. Time is passed in as `now_ms`; the shell pauses it on Background (`pause`/`resume`).
+- Shell: `src/main.rs` routes GAM messages and runs the appkit pump only while a quiz screen is showing; `src/app.rs` maps `Key` to core `Input`, saves and draws.
+- Storage: one versioned JSON blob (`mathdrill`/`state`: selection plus bests per mode and level), saved only when dirty (menu leave, session end, background). Unreadable or newer data is never overwritten.
+- Every screen exits on Backspace/F4. `∴` is never delivered. Leave with `kit::leave`, never `terminate_process`.

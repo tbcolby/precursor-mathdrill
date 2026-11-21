@@ -1,0 +1,14 @@
+{
+    "mathdrill": {
+        "context_name": "Math Drill",
+        "menu_name": {
+            "appmenu.mathdrill": {
+                "en": "Math Drill",
+                "en-tts": "Math Drill",
+                "fr": "Math Drill",
+                "ja": "Math Drill",
+                "zh": "Math Drill"
+            }
+        }
+    }
+}
