@@ -1,162 +1,95 @@
-//! Precursor Math Drill
-//!
-//! Timed arithmetic quiz with TRNG-generated problems.
-//! Tracks streaks and best scores per difficulty.
-
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
+//! Math Drill for Precursor. Problem generation, scoring and the quiz state
+//! machine live in `mathdrill-core` (host-tested); this crate is the Xous shell.
 
 mod app;
-mod problems;
-mod rng;
-mod storage;
-mod ui;
 
-use app::MathDrillApp;
-use rng::Rng;
-use num_traits::FromPrimitive;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
+use precursor_appkit::{app as kit, keys, pump, rng, store};
 
+/// xous-names server name. Any unique string; NOT the GAM app name.
 const SERVER_NAME: &str = "_Math Drill_";
-const APP_NAME: &str = "Math Drill";
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
-enum AppOp {
+pub(crate) enum AppOp {
     Redraw = 0,
-    Rawkeys = 1,
-    FocusChange = 2,
-    Quit = 255,
+    Rawkeys,
+    FocusChange,
+    Tick,
+    BasisChanged,
+    Quit,
 }
 
 fn main() -> ! {
     log_server::init_wait().unwrap();
     log::set_max_level(log::LevelFilter::Info);
-    log::info!("Math Drill starting, PID {}", xous::process::id());
+    log::info!("mathdrill PID is {}", xous::process::id());
 
     let xns = xous_names::XousNames::new().unwrap();
-    let sid = xns
-        .register_name(SERVER_NAME, None)
-        .expect("can't register server");
-    let gam = gam::Gam::new(&xns).expect("can't connect to GAM");
-    let tt = ticktimer_server::Ticktimer::new().unwrap();
-    let rng = Rng::new(&xns);
+    let sid = xns.register_name(SERVER_NAME, None).expect("can't register server");
 
-    let token = gam
-        .register_ux(gam::UxRegistration {
-            app_name: String::from(gam::APP_NAME_MATHDRILL),
-            ux_type: gam::UxType::Framebuffer,
-            predictor: None,
-            listener: sid.to_array(),
-            redraw_id: AppOp::Redraw.to_u32().unwrap(),
-            gotinput_id: None,
-            audioframe_id: None,
-            rawkeys_id: Some(AppOp::Rawkeys.to_u32().unwrap()),
-            focuschange_id: Some(AppOp::FocusChange.to_u32().unwrap()),
-        })
-        .expect("couldn't register UX")
-        .unwrap();
+    // GAM app name comes from apps/manifest.json key "mathdrill".
+    let reg = kit::register(
+        &xns,
+        sid,
+        gam::APP_NAME_MATHDRILL,
+        gam::UxType::Framebuffer,
+        kit::Opcodes {
+            redraw: AppOp::Redraw.to_u32().unwrap(),
+            rawkeys: Some(AppOp::Rawkeys.to_u32().unwrap()),
+            focus_change: Some(AppOp::FocusChange.to_u32().unwrap()),
+            got_input: None,
+        },
+    );
 
-    let content = gam
-        .request_content_canvas(token)
-        .expect("couldn't get canvas");
-    let screensize = gam
-        .get_canvas_bounds(content)
-        .expect("couldn't get dimensions");
-    log::info!("Canvas size: {:?}", screensize);
+    let trng = rng::Trng::new(&xns).expect("TRNG unavailable");
+    let store = store::Store::open("mathdrill");
+    store::watch_bases(xous::connect(sid).unwrap(), AppOp::BasisChanged.to_usize().unwrap());
+    let pump = pump::Pump::spawn(xous::connect(sid).unwrap(), AppOp::Tick.to_usize().unwrap(), 500);
 
-    let mut app = MathDrillApp::new();
-    app.init_storage();
-    let mut allow_redraw = true;
-    ui::draw(&app, &gam, content);
-
-    // Cache best scores for display
-    let mut cached_easy = app.get_best(&problems::Difficulty::Easy);
-    let mut cached_medium = app.get_best(&problems::Difficulty::Medium);
-    let mut cached_hard = app.get_best(&problems::Difficulty::Hard);
+    let mut app = app::App::new(reg.screen, store, trng);
 
     loop {
         let msg = xous::receive_message(sid).unwrap();
-        let now_ms = tt.elapsed_ms();
-
         match FromPrimitive::from_usize(msg.body.id()) {
-            Some(AppOp::Redraw) => {
-                if allow_redraw {
-                    app.needs_redraw = true;
-                    if app.state == app::AppState::BestScores {
-                        ui::draw_best_with_data(
-                            &gam, content,
-                            cached_easy.as_ref(),
-                            cached_medium.as_ref(),
-                            cached_hard.as_ref(),
-                        );
-                    } else {
-                        ui::draw(&app, &gam, content);
+            Some(AppOp::Redraw) => app.draw(),
+            Some(AppOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
+                for key in keys::decode_rawkeys([k1, k2, k3, k4]) {
+                    if app.on_key(key) == app::Action::Leave {
+                        kit::leave(app.screen());
                     }
                 }
-            }
-            Some(AppOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
-                let keys = [
-                    core::char::from_u32(k1 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k2 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k3 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k4 as u32).unwrap_or('\u{0000}'),
-                ];
-                let mut should_quit = false;
-                for &key in keys.iter() {
-                    if key != '\u{0000}' {
-                        if !app.handle_key(key, now_ms, &rng) {
-                            should_quit = true;
-                            break;
+                app.draw();
+                if app.wants_tick() { pump.run() } else { pump.stop() }
+            }),
+            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, code, _, _, _, {
+                match kit::focus_state(code) {
+                    gam::FocusState::Foreground => {
+                        app.on_foreground();
+                        if app.wants_tick() {
+                            pump.run();
                         }
                     }
-                }
-                if should_quit { break; }
-
-                // Check feedback timeout
-                app.check_feedback_timeout(now_ms, &rng);
-
-                if app.needs_redraw && allow_redraw {
-                    if app.state == app::AppState::BestScores {
-                        // Refresh cache
-                        cached_easy = app.get_best(&problems::Difficulty::Easy);
-                        cached_medium = app.get_best(&problems::Difficulty::Medium);
-                        cached_hard = app.get_best(&problems::Difficulty::Hard);
-                        ui::draw_best_with_data(
-                            &gam, content,
-                            cached_easy.as_ref(),
-                            cached_medium.as_ref(),
-                            cached_hard.as_ref(),
-                        );
-                    } else {
-                        ui::draw(&app, &gam, content);
-                    }
-                    app.needs_redraw = false;
-                }
-            }),
-            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, state_code, _, _, _, {
-                match gam::FocusState::convert_focus_change(state_code) {
                     gam::FocusState::Background => {
-                        allow_redraw = false;
-                        app.save_state();
-                    }
-                    gam::FocusState::Foreground => {
-                        allow_redraw = true;
-                        // Refresh best scores cache
-                        cached_easy = app.get_best(&problems::Difficulty::Easy);
-                        cached_medium = app.get_best(&problems::Difficulty::Medium);
-                        cached_hard = app.get_best(&problems::Difficulty::Hard);
-                        ui::draw(&app, &gam, content);
+                        pump.stop();
+                        app.on_background();
                     }
                 }
             }),
+            Some(AppOp::Tick) => {
+                app.on_tick();
+                if !app.wants_tick() {
+                    pump.stop();
+                }
+                pump::ack(&msg);
+            }
+            Some(AppOp::BasisChanged) => app.reload(),
             Some(AppOp::Quit) => break,
-            _ => log::warn!("unknown opcode: {:?}", msg.body.id()),
+            None => log::warn!("unknown opcode {:?}", msg.body.id()),
         }
     }
-
-    app.save_state();
-    xns.unregister_server(sid).unwrap();
-    xous::destroy_server(sid).unwrap();
-    xous::terminate_process(0)
+    pump.quit();
+    kit::shutdown(&xns, sid)
 }
